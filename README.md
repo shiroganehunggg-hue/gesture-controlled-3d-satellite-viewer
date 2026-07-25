@@ -12,9 +12,9 @@ An interactive 3D satellite model viewer controlled via real-time hand gestures 
 ---
 
 ## 🛠️ Built With
-- **Language**: Python 3.x
+- **Language**: Python 3.11
 - **Computer Vision**: OpenCV, MediaPipe
-- **3D Rendering**: PyOpenGL / ModernGL / PyGame *(sửa lại đúng thư viện rendering bạn dùng)*
+- **3D Rendering**: ModernGL
 
 ---
 
