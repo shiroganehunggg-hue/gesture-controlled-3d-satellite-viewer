@@ -11,6 +11,7 @@ Hai tay dieu khien cube:
 
 pip install moderngl pyrr numpy opencv-python mediapipe
 """
+import argparse
 from pathlib import Path
 from stl import mesh
 
@@ -56,6 +57,8 @@ THREE_PINCH_EXIT = 0.38
 # Nam tay can nhay hon mot chut; hysteresis lon giup khong chop tat.
 # Cao hon nguong fist-exit de pinch/three-finger pinch khong bi xem la xoe tay.
 OPEN_HAND_DEBOUNCE_FRAMES = 4
+MODEL_SELECTOR_STEP_RAD = math.radians(35)
+MODEL_SELECTOR_HOLD_SECONDS = 3.0
 
 # Doi 2 gia tri nay neu muon dao vai tro tay trai/phai
 GRAB_HAND_LABEL = "Right"
@@ -101,6 +104,33 @@ ROCKET_PART_ORDER = (
     "escape tower.stl",
 )
 
+# Model rover hien thi rieng, khong phai la mot manh cua Saturn V.
+ROVER_MODEL_FILENAME = "Curiosity Rover (MSL) (Clean).stl"
+ROVER_WORLD_SIZE = 3.0
+ROMAN_MODEL_FILENAME = "Nancy Grace Roman Space Telescope (1).stl"
+ROMAN_WORLD_SIZE = 3.2
+# Roman co nhieu tam giac nho lien ket; lay mau thua lam be vo be mat.
+# Giu day du mesh de cac manh cua kinh thien van lien tuc.
+ROMAN_MAX_TRIANGLES = None
+MODEL_CHOICES = ("rover", "saturn", "roman")
+# STL rover co kem 12 triangle tao thanh mot khoi lap phuong 1x1 khong thuoc
+# rover. Cac mat rover lon nhat nho hon 0.31, nen nguong nay chi loai khoi do.
+ROVER_PLACEHOLDER_CUBE_AREA = 0.49
+
+
+def selected_model_mode():
+    parser = argparse.ArgumentParser(description="Gesture-controlled 3D model viewer")
+    parser.add_argument(
+        "--model",
+        choices=MODEL_CHOICES,
+        default="rover",
+        help="Model to show: rover (default), saturn, or roman.",
+    )
+    return parser.parse_known_args()[0].model
+
+
+ACTIVE_MODEL_MODE = selected_model_mode()
+
 
 class Model:
     """Small STL-backed ModernGL model wrapper with transform state."""
@@ -115,6 +145,8 @@ class Model:
         scale=None,
         local_y_flip=True,
         local_y_rotation=0.0,
+        local_x_rotation=0.0,
+        max_triangles=None,
     ):
         self.ctx = ctx
         self.program = program
@@ -126,6 +158,8 @@ class Model:
         # rocket luon huong len va moi noi van dung dung vi tri.
         self.local_y_flip = local_y_flip
         self.local_y_rotation = local_y_rotation
+        self.local_x_rotation = local_x_rotation
+        self.max_triangles = max_triangles
         self.mesh = self._load_mesh(mesh_path)
         self.center = np.zeros(3, dtype=np.float32)
         if scale is None:
@@ -197,6 +231,15 @@ class Model:
 
     def _build_gl_buffers(self):
         triangles = self.mesh.vectors.astype(np.float32)
+        if Path(self.mesh_path).name.lower() == ROVER_MODEL_FILENAME.lower():
+            double_areas = np.linalg.norm(
+                np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]),
+                axis=1,
+            )
+            triangles = triangles[double_areas / 2 < ROVER_PLACEHOLDER_CUBE_AREA]
+        if self.max_triangles is not None and len(triangles) > self.max_triangles:
+            stride = math.ceil(len(triangles) / self.max_triangles)
+            triangles = triangles[::stride]
         positions = (triangles.reshape(-1, 3) - self.center).astype(np.float32)
         if self.local_y_flip:
             positions[:, 1] *= -1.0
@@ -207,6 +250,13 @@ class Model:
             z = positions[:, 2].copy()
             positions[:, 0] = x * cosine + z * sine
             positions[:, 2] = -x * sine + z * cosine
+        if self.local_x_rotation:
+            cosine = math.cos(self.local_x_rotation)
+            sine = math.sin(self.local_x_rotation)
+            y = positions[:, 1].copy()
+            z = positions[:, 2].copy()
+            positions[:, 1] = y * cosine - z * sine
+            positions[:, 2] = y * sine + z * cosine
         positions = positions * self.scale
         colors = self._saturn_v_colors(positions)
         y_min = positions[:, 1].min()
@@ -365,6 +415,17 @@ def is_open_hand(landmarks):
     finger_pairs = ((8, 6), (12, 10), (16, 14), (20, 18))
     extended = sum(landmarks[tip].y < landmarks[pip].y for tip, pip in finger_pairs)
     return extended >= 3
+
+
+def palm_rotation_angle(landmarks, w, h):
+    """Goc cua truc co tay -> goc ngon giua, dung de xoay scope chon model."""
+    wrist = landmarks[0]
+    middle_mcp = landmarks[9]
+    return math.atan2((middle_mcp.y - wrist.y) * h, (middle_mcp.x - wrist.x) * w)
+
+
+def wrapped_angle_delta(current, previous):
+    return (current - previous + math.pi) % (2 * math.pi) - math.pi
 
 
 def is_fist_hand(landmarks, w, h):
@@ -616,10 +677,46 @@ def discover_stl_paths():
     return sorted(model_dir.glob("*.stl"), key=lambda path: path.name.lower())
 
 
-def build_scene_models():
+def build_scene_models(model_mode):
     stl_paths = discover_stl_paths()
     if not stl_paths:
         return [Model(ctx, prog, "models/command moduel.stl")]
+
+    # Rover dung mot file STL hoan chinh. STL goc dung truc Z lam chieu cao,
+    # nen xoay sang truc Y cua scene truoc khi render.
+    rover_path = next(
+        (path for path in stl_paths if path.name.lower() == ROVER_MODEL_FILENAME.lower()),
+        None,
+    )
+    if model_mode == "rover" and rover_path is not None:
+        vertices = mesh.Mesh.from_file(str(rover_path)).vectors.reshape(-1, 3)
+        rover_scale = ROVER_WORLD_SIZE / max(float((vertices.max(axis=0) - vertices.min(axis=0)).max()), 1e-6)
+        rover = Model(
+            ctx,
+            prog,
+            rover_path,
+            scale=[rover_scale] * 3,
+            local_y_flip=False,
+            local_x_rotation=-math.pi / 2,
+        )
+        rover.is_rover = True
+        return [rover]
+
+    roman_path = next((path for path in stl_paths if path.name.lower() == ROMAN_MODEL_FILENAME.lower()), None)
+    if model_mode == "roman" and roman_path is not None:
+        vertices = mesh.Mesh.from_file(str(roman_path)).vectors.reshape(-1, 3)
+        roman_scale = ROMAN_WORLD_SIZE / max(float((vertices.max(axis=0) - vertices.min(axis=0)).max()), 1e-6)
+        roman = Model(
+            ctx,
+            prog,
+            roman_path,
+            scale=[roman_scale] * 3,
+            local_y_flip=False,
+            local_x_rotation=-math.pi / 2,
+            max_triangles=ROMAN_MAX_TRIANGLES,
+        )
+        roman.is_roman = True
+        return [roman]
 
     paths_by_role = {path.name.lower(): path for path in stl_paths}
     ordered_paths = [paths_by_role[role] for role in ROCKET_PART_ORDER if role in paths_by_role]
@@ -734,46 +831,45 @@ def rocket_offset_for(model):
     return getattr(model, "rocket_offset", (0.0, 0.0, 0.0))
 
 
-scene_models = build_scene_models()
+scene_models = build_scene_models(ACTIVE_MODEL_MODE)
 scene_model = scene_models[0]
 
-GRAY = 0.6, 0.6, 0.6
-vertices = np.array([
-    -1, -1, -1, *GRAY,
-     1, -1, -1, *GRAY,
-     1,  1, -1, *GRAY,
-    -1,  1, -1, *GRAY,
-    -1, -1,  1, *GRAY,
-     1, -1,  1, *GRAY,
-     1,  1,  1, *GRAY,
-    -1,  1,  1, *GRAY,
-], dtype="f4")
+def switch_scene_model(model_mode):
+    """Nap model duoc xac nhan trong scope chon model."""
+    global ACTIVE_MODEL_MODE, scene_models, scene_model
+    if model_mode == ACTIVE_MODEL_MODE:
+        return
+    for model in scene_models:
+        for resource in (model.vao, model.vbo, model.ibo):
+            resource.release()
+    ACTIVE_MODEL_MODE = model_mode
+    scene_models = build_scene_models(model_mode)
+    scene_model = scene_models[0]
 
-indices = np.array([
-    0, 1, 2, 2, 3, 0,
-    4, 5, 6, 6, 7, 4,
-    0, 1, 5, 5, 4, 0,
-    2, 3, 7, 7, 6, 2,
-    1, 2, 6, 6, 5, 1,
-    0, 3, 7, 7, 4, 0,
-], dtype="i4")
 
-# Fallback cube dung cung vertex layout voi STL (position, color, height,
-# style, normal) de shader co the khoi tao ngay ca khi khong tim thay model.
-_cube_vertices = vertices.reshape(-1, 6)
-vertices = np.hstack([
-    _cube_vertices,
-    np.full((len(_cube_vertices), 1), 0.5, dtype="f4"),
-    np.zeros((len(_cube_vertices), 1), dtype="f4"),
-    np.tile(np.array([[0.0, 0.0, 1.0]], dtype="f4"), (len(_cube_vertices), 1)),
-]).astype("f4").reshape(-1)
-vbo = ctx.buffer(vertices.tobytes())
-ibo = ctx.buffer(indices.tobytes())
-vao = ctx.vertex_array(
-    prog,
-    [(vbo, "3f 3f 1f 1f 3f", "in_position", "in_color", "in_height", "in_style", "in_normal")],
-    ibo,
-)
+def draw_model_scope(frame, selected_model, hold_seconds):
+    """Ve scope de xem model dang duoc chon va tien trinh nam tay xac nhan."""
+    height, width = frame.shape[:2]
+    center = (width - 105, height - 120)
+    radius = 88
+    colors = {"rover": (0, 255, 0), "saturn": (0, 220, 255), "roman": (255, 120, 255)}
+    color = colors[selected_model]
+
+    cv2.circle(frame, center, radius, (30, 30, 30), -1)
+    cv2.circle(frame, center, radius, color, 2)
+    cv2.line(frame, (center[0] - radius, center[1]), (center[0] + radius, center[1]), color, 1)
+    cv2.line(frame, (center[0], center[1] - radius), (center[0], center[1] + radius), color, 1)
+    cv2.putText(frame, "MODEL SCOPE", (center[0] - 44, center[1] - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+    cv2.putText(frame, "ROVER", (center[0] - 29, center[1] - 27), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                color if selected_model == "rover" else (170, 170, 170), 1)
+    cv2.putText(frame, "SATURN", (center[0] - 34, center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                color if selected_model == "saturn" else (170, 170, 170), 1)
+    cv2.putText(frame, "ROMAN", (center[0] - 30, center[1] + 27), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                color if selected_model == "roman" else (170, 170, 170), 1)
+    progress = min(hold_seconds / MODEL_SELECTOR_HOLD_SECONDS, 1.0)
+    cv2.ellipse(frame, center, (radius - 7, radius - 7), -90, 0, 360 * progress, color, 5)
+    cv2.putText(frame, f"{hold_seconds:.1f}/3s", (center[0] - 24, center[1] + 58),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
 color_rbo = ctx.renderbuffer((WIDTH, HEIGHT), components=4)
 depth_rbo = ctx.depth_renderbuffer((WIDTH, HEIGHT))
@@ -828,9 +924,6 @@ def render_cube(angle_x, angle_y, obj_x, obj_y, obj_z, assembly=1.0):
             mv = pyrr.matrix44.multiply(model_matrix, view)
             model_mvp = pyrr.matrix44.multiply(mv, proj)
             model.draw(model_mvp)
-    else:
-        vao.render(moderngl.TRIANGLES)
-
     raw = fbo.read(components=4, dtype="f1")
     img = np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT, WIDTH, 4)).copy()
     return np.flipud(img)
@@ -900,13 +993,16 @@ def main():
     rotate_state = GestureState(three_finger_pinch_ratio, palm_center_px, THREE_PINCH_ENTER, THREE_PINCH_EXIT)
     target_x, target_y, target_z = obj_x, obj_y, obj_z
     target_angle_x, target_angle_y = angle_x, angle_y
-    # 0 = exploded view luc mo app, 1 = Saturn V da ghep hoan chinh.
-    assembly = 0.0
-    rocket_is_assembled = False
-    fist_was_active = False
-    fist_frame_count = 0
+    # Scope chon model dung fist giu 3 giay, nen Saturn V luon bat dau o trang
+    # thai da ghep de fist khong bi trung chuc nang assemble cu.
+    assembly = 1.0
+    rocket_is_assembled = True
+    selected_model = ACTIVE_MODEL_MODE
+    last_selector_angle = None
+    selector_rotation = 0.0
+    fist_hold_started = None
+    fist_selection_confirmed = False
     two_open_frame_count = 0
-
     grab_filter = VecEuroFilter(3, min_cutoff=0.6, beta=0.15)
     rotate_filter = VecEuroFilter(2, min_cutoff=0.6, beta=0.15)
     missed_frame_count = 0
@@ -915,6 +1011,9 @@ def main():
     MAX_REOPEN_ATTEMPTS = 3
 
     while True:
+        is_rover_scene = bool(scene_models and getattr(scene_models[0], "is_rover", False))
+        is_roman_scene = bool(scene_models and getattr(scene_models[0], "is_roman", False))
+        is_saturn_scene = not is_rover_scene and not is_roman_scene
         ret, frame = cap.read()
         if not ret or frame is None:
             missed_frame_count += 1
@@ -973,24 +1072,50 @@ def main():
         is_pinching = grab_state.active
         is_rotating = rotate_state.active
         fist_detected = any(is_fist_hand(points, w, h) for points in all_landmark_lists)
-        fist_frame_count = fist_frame_count + 1 if fist_detected else 0
-        # Hai frame lien tiep de chong nhay, nhung khong dung hysteresis dai
-        # nen moi lan nam/tha deu reset ngay cho lan ke tiep.
-        is_fist = fist_frame_count >= 2
-        # Fist la nut "ghep" mot lan: tha tay ra rocket van giu nguyen de
-        # nguoi dung co the dung pinch keo va three-finger pinch de xoay.
-        if is_fist and not fist_was_active:
-            rocket_is_assembled = True
-        fist_was_active = is_fist
+        is_fist = fist_detected
 
-        # Chi bung khi co hai ban tay trong khung hinh va CA HAI deu xoe.
-        # Dung nguong exit de tranh bung nham luc mot tay dang nam/pinch.
+        # Xoe tay va xoay co tay trai/phai de doi muc dang sang trong scope.
+        selector_hand = next((points for points in all_landmark_lists if is_open_hand(points)), None)
+        if selector_hand is not None and not is_pinching and not is_rotating and not is_fist:
+            current_selector_angle = palm_rotation_angle(selector_hand, w, h)
+            if last_selector_angle is not None:
+                selector_rotation += wrapped_angle_delta(current_selector_angle, last_selector_angle)
+                if abs(selector_rotation) >= MODEL_SELECTOR_STEP_RAD:
+                    current_index = MODEL_CHOICES.index(selected_model)
+                    direction = 1 if selector_rotation > 0 else -1
+                    selected_model = MODEL_CHOICES[(current_index + direction) % len(MODEL_CHOICES)]
+                    selector_rotation = 0.0
+            last_selector_angle = current_selector_angle
+        else:
+            last_selector_angle = None
+            selector_rotation = 0.0
+
+        # Nam tay lien tuc 3 giay de xac nhan model dang sang.
+        if is_fist:
+            if fist_hold_started is None:
+                fist_hold_started = now
+            fist_hold_seconds = now - fist_hold_started
+            if fist_hold_seconds >= MODEL_SELECTOR_HOLD_SECONDS and not fist_selection_confirmed:
+                switch_scene_model(selected_model)
+                rocket_is_assembled = True
+                fist_selection_confirmed = True
+        else:
+            # Nam tay nhanh la lenh ghep Saturn V; giu du 3 giay van danh
+            # rieng cho viec xac nhan model trong scope.
+            if is_saturn_scene and fist_hold_started is not None and not fist_selection_confirmed:
+                rocket_is_assembled = True
+            fist_hold_started = None
+            fist_hold_seconds = 0.0
+            fist_selection_confirmed = False
+
+        # Hai ban tay xoe lien tuc se tach cac tang Saturn V. Khong ap dung
+        # cho rover/Roman de tranh tac dong ngoai y muon.
         two_hands_open = (
             len(all_landmark_lists) >= 2
             and all(is_open_hand(points) for points in all_landmark_lists[:2])
         )
         two_open_frame_count = two_open_frame_count + 1 if two_hands_open else 0
-        if two_open_frame_count >= OPEN_HAND_DEBOUNCE_FRAMES:
+        if is_saturn_scene and two_open_frame_count >= OPEN_HAND_DEBOUNCE_FRAMES:
             rocket_is_assembled = False
         obj_screen = world_to_screen(obj_x, obj_y)
         hand_distance = None
@@ -1079,28 +1204,39 @@ def main():
             2,
         )
 
+        instruction = (
+            "Curiosity Rover | Pinch = move | Three-finger pinch = rotate"
+            if is_rover_scene
+            else (
+                "Nancy Grace Roman Telescope | Pinch = move | Three-finger pinch = rotate"
+                if scene_models and getattr(scene_models[0], "is_roman", False)
+                else "Saturn V | Fist short = assemble | 2 open hands = explode"
+            )
+        )
         cv2.putText(
             composited,
-            f"Fist = assemble | 2 open hands = explode: {assemble_status}  {assembly * 100:.0f}%",
+            instruction,
             (20, 80),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
-            (255, 255, 255) if rocket_is_assembled else (180, 180, 180),
+            (0, 255, 255) if is_rover_scene else ((255, 255, 255) if rocket_is_assembled else (180, 180, 180)),
             2,
         )
-
-        obj_sx, obj_sy = world_to_screen(obj_x, obj_y)
-        cv2.circle(
+        cv2.putText(
             composited,
-            (int(obj_sx), int(obj_sy)),
-            GRAB_RADIUS_PX,
-            grab_color,
+            "Open palm + rotate = choose model | Hold fist 3s = confirm | Q = quit",
+            (20, 105),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
             1,
         )
+        draw_model_scope(composited, selected_model, fist_hold_seconds)
 
         cv2.imshow("Two-hand Grab + Rotate", composited)
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
             break
 
     cap.release()
